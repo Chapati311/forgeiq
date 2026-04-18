@@ -2558,7 +2558,16 @@ body::after{display:none;}
 
 // ─────────────────────────────────────────────────────────
 //  SUPABASE — cross-device data sync
-//  Replace these two values with your own from supabase.com
+//
+//  Run this SQL once in your Supabase SQL editor:
+//
+//  create table if not exists forgeiq_users (
+//    email text primary key,
+//    user_data jsonb,
+//    updated_at timestamptz default now()
+//  );
+//  alter table forgeiq_users disable row level security;
+//
 // ─────────────────────────────────────────────────────────
 var SUPABASE_URL = 'https://owdpahfofolqvmmwqimy.supabase.co';
 var SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im93ZHBhaGZvZm9sdnFtbXdxaW15Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYxNzI3OTEsImV4cCI6MjA5MTc0ODc5MX0.fCfW7lm3Onlzv-lDhppKGm6f6uWBsf8DGHVGgJSYeSM';
@@ -2569,72 +2578,100 @@ try {
 } catch(e) { console.warn('Supabase not configured yet'); }
 
 // Save S to Supabase (upsert)
+// ── CLOUD SAVE STATUS ──
+var _cloudOK = true; // set false if table missing so we stop spamming
+
 async function saveToCloud(){
-  if(!sb||!S.user) return;
+  if(!sb || !S.user || !_cloudOK) return;
   try{
-    var payload={
+    // Trim chat sessions to last 20 to keep payload small
+    var dataToSave = JSON.parse(JSON.stringify(S));
+    if(dataToSave.chatSessions && dataToSave.chatSessions.length > 20){
+      dataToSave.chatSessions = dataToSave.chatSessions.slice(0, 20);
+    }
+    // Trim food log to last 200 entries
+    if(dataToSave.foodLog && dataToSave.foodLog.length > 200){
+      dataToSave.foodLog = dataToSave.foodLog.slice(-200);
+    }
+
+    var payload = {
       email: S.user,
-      data: JSON.stringify(S),
+      user_data: JSON.stringify(dataToSave),
       updated_at: new Date().toISOString()
     };
-    var res=await sb.from('forgeiq_users').upsert(payload, {onConflict:'email'});
-    if(res.error) console.warn('Cloud save error:',res.error);
-  }catch(e){ console.warn('Cloud save failed:',e); }
-}
 
-// Load S from Supabase
-async function loadFromCloud(email){
-  if(!sb||!email||SUPABASE_URL==='YOUR_SUPABASE_URL') return false;
-  try{
-    var res = await sb.from('forgeiq_users').select('data').eq('email',email).single();
-    if(res.data&&res.data.data){
-      var parsed=JSON.parse(res.data.data);
-      // Deep merge into S
-      S.xp=parsed.xp||0; S.streak=parsed.streak||0;
-      S.totalWorkouts=parsed.totalWorkouts||0;
-      S.lastWorkoutDate=parsed.lastWorkoutDate||null;
-      S.plans=parsed.plans||[];
-      S.foodLog=parsed.foodLog||[];
-      S.prs=parsed.prs||[];
-      S.weightLog=parsed.weightLog||[];
-      S.weekWorkouts=parsed.weekWorkouts||[];
-      S.milestonesDone=parsed.milestonesDone||[];
-      S._weekStamp=parsed._weekStamp||'';
-      S.profile=Object.assign({name:'',age:'',height:'',weight:'',goal:'muscle'},parsed.profile||{});
-      S.macros=Object.assign({cals:2000,protein:150,carbs:250,fat:65},parsed.macros||{});
-      S.stats=Object.assign({str:0,end:0,dis:0,vit:0},parsed.stats||{});
-      S.tasksDone=parsed.tasksDone||{};
-      S.dailyQuestsDone=parsed.dailyQuestsDone||{};
-      S.exHistory=parsed.exHistory||{};
-      S.exLastWeight=parsed.exLastWeight||{};
-      S.exSessionXP=parsed.exSessionXP||{};
-      S.workoutHistory=parsed.workoutHistory||[];
-      S.dailyXP=parsed.dailyXP||{};
-      S.profileXpAwarded=parsed.profileXpAwarded||false;
-      if(parsed.chatSessions) S.chatSessions=parsed.chatSessions;
-      if(parsed.moodLog) S.moodLog=parsed.moodLog;
-      if(parsed.habits) S.habits=parsed.habits;
-      if(parsed.journal) S.journal=parsed.journal;
-      if(parsed.goals) S.goals=parsed.goals;
-      if(parsed.skills) S.skills=parsed.skills;
-      if(parsed.totalJournals!==undefined) S.totalJournals=parsed.totalJournals;
-      return true;
+    var res = await sb.from('forgeiq_users').upsert(payload, {onConflict: 'email'});
+
+    if(res.error){
+      // Table doesn't exist yet — tell user once, then stop trying
+      if(res.error.code === '42P01' || res.error.message.indexOf('does not exist') >= 0){
+        _cloudOK = false;
+        console.info('ForgeIQ: Supabase table not set up yet. Run the SQL setup. Data saved locally only.');
+      } else if(res.error.code === '42501' || res.error.message.indexOf('row-level security') >= 0){
+        _cloudOK = false;
+        console.info('ForgeIQ: Supabase RLS blocking saves. Disable RLS on forgeiq_users or add a policy. Data saved locally only.');
+      } else {
+        console.warn('ForgeIQ cloud save error:', res.error.message);
+      }
     }
-  }catch(e){ console.warn('Cloud load failed:',e); }
-  return false;
+  } catch(e){
+    // Network error — fail silently, localStorage still has the data
+    console.info('ForgeIQ: Cloud save skipped (offline?)');
+  }
 }
 
-// Patch save() to also save to cloud (debounced)
-var _origSave=null;
-var _cloudSaveTimer=null;
+// ── CLOUD LOAD ──
+async function loadFromCloud(email){
+  if(!sb || !email || !_cloudOK) return false;
+  try{
+    var res = await sb.from('forgeiq_users').select('user_data').eq('email', email).maybeSingle();
+
+    if(res.error){
+      if(res.error.code === '42P01'){
+        _cloudOK = false;
+        console.info('ForgeIQ: Table not set up. Using local data.');
+      }
+      return false;
+    }
+
+    if(!res.data || !res.data.user_data) return false; // new user, no cloud data yet
+
+    var parsed = JSON.parse(res.data.user_data);
+
+    // Full deep restore — every field
+    var fields = [
+      'xp','streak','totalWorkouts','lastWorkoutDate','activePlanId',
+      'plans','foodLog','prs','weightLog','weekWorkouts','milestonesDone',
+      '_weekStamp','tasksDone','dailyQuestsDone','exHistory','exLastWeight',
+      'exSessionXP','workoutHistory','dailyXP','profileXpAwarded',
+      'chatSessions','moodLog','habits','journal','goals','skills',
+      'totalJournals','weekJournalCount','weekFoodDays'
+    ];
+    fields.forEach(function(f){ if(parsed[f] !== undefined) S[f] = parsed[f]; });
+
+    // Merge objects with defaults
+    S.profile = Object.assign({name:'',age:'',height:'',weight:'',goal:'muscle'}, parsed.profile||{});
+    S.macros   = Object.assign({cals:2000,protein:150,carbs:250,fat:65}, parsed.macros||{});
+    S.stats    = Object.assign({str:0,end:0,dis:0,vit:0}, parsed.stats||{});
+
+    return true;
+  } catch(e){
+    console.info('ForgeIQ: Cloud load failed:', e.message);
+    return false;
+  }
+}
+
+// ── PATCH SAVE TO ALSO SYNC CLOUD (debounced 4s) ──
+var _origSave = null;
+var _cloudSaveTimer = null;
 function patchSaveWithCloud(){
-  if(_origSave)return;
-  _origSave=save;
-  save=function(){
+  if(_origSave) return;
+  _origSave = save;
+  save = function(){
     _origSave();
-    // Debounce cloud saves to max 1 per 3 seconds
+    if(!_cloudOK) return;
     clearTimeout(_cloudSaveTimer);
-    _cloudSaveTimer=setTimeout(function(){saveToCloud();},3000);
+    _cloudSaveTimer = setTimeout(function(){ saveToCloud(); }, 4000);
   };
 }
 
