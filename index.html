@@ -1737,6 +1737,7 @@ body::after{display:none;}
         </div>
         <div class="hud-level" id="hud-lv">LV 1</div>
       </div>
+      <button onclick="doLogout()" title="Sign out" aria-label="Sign out" style="background:transparent;border:1px solid var(--border);border-radius:8px;color:var(--muted);padding:6px 9px;cursor:pointer;font-size:13px;transition:all 0.2s;flex-shrink:0" onmouseover="this.style.color='var(--red)';this.style.borderColor='rgba(248,113,113,0.4)'" onmouseout="this.style.color='var(--muted)';this.style.borderColor='var(--border)'">⏏</button>
     </div>
   </div>
 
@@ -1751,6 +1752,7 @@ body::after{display:none;}
     <button class="mob-nav-btn" id="mn-motivation" onclick="goPage('motivation');closeMobileNav()">🔥 Motivation</button>
     <button class="mob-nav-btn" id="mn-improve" onclick="goPage('improve');closeMobileNav()">⬆️ Growth</button>
     <button class="mob-nav-btn" id="mn-profile" onclick="goPage('profile');closeMobileNav()">👤 Profile</button>
+    <button class="mob-nav-btn" onclick="doLogout();closeMobileNav()" style="color:var(--red);border-color:rgba(248,113,113,0.2);margin-top:8px">⏏ Sign Out</button>
   </div>
 
   <div class="app-body" id="main-content" role="main">
@@ -2572,108 +2574,119 @@ body::after{display:none;}
 var SUPABASE_URL = 'https://owdpahfofolqvmmwqimy.supabase.co';
 var SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im93ZHBhaGZvZm9sdnFtbXdxaW15Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYxNzI3OTEsImV4cCI6MjA5MTc0ODc5MX0.fCfW7lm3Onlzv-lDhppKGm6f6uWBsf8DGHVGgJSYeSM';
 
+// Use raw fetch instead of Supabase SDK to avoid DataCloneError with Headers
+// The SDK internally uses non-cloneable objects that break in some browsers
 var sb = null;
 try {
   sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 } catch(e) { console.warn('Supabase not configured yet'); }
 
-// Save S to Supabase (upsert)
-// ── CLOUD SAVE STATUS ──
-var _cloudOK = true; // set false if table missing so we stop spamming
+// Raw REST helper — bypasses SDK to avoid Headers DataCloneError
+async function sbREST(method, path, body){
+  var url = SUPABASE_URL + '/rest/v1/' + path;
+  var opts = {
+    method: method,
+    headers: {
+      'apikey': SUPABASE_ANON_KEY,
+      'Authorization': 'Bearer ' + SUPABASE_ANON_KEY,
+      'Content-Type': 'application/json',
+      'Prefer': 'resolution=merge-duplicates,return=minimal'
+    }
+  };
+  if(body) opts.body = JSON.stringify(body);
+  var res = await fetch(url, opts);
+  // Extract status immediately — don't store Response object anywhere
+  var status = res.status;
+  var text = '';
+  try { text = await res.text(); } catch(e){}
+  return { status: status, text: text };
+}
 
-async function saveToCloud(){
-  if(!sb || !S.user || !_cloudOK) return;
+// ── CLOUD SYNC — raw fetch to avoid DataCloneError with Supabase SDK ──
+var _cloudOK = true;
+
+// Raw REST helper — no SDK objects stored, all plain strings
+async function sbREST(method, path, body){
   try{
-    // Trim chat sessions to last 20 to keep payload small
-    var dataToSave = JSON.parse(JSON.stringify(S));
-    if(dataToSave.chatSessions && dataToSave.chatSessions.length > 20){
-      dataToSave.chatSessions = dataToSave.chatSessions.slice(0, 20);
-    }
-    // Trim food log to last 200 entries
-    if(dataToSave.foodLog && dataToSave.foodLog.length > 200){
-      dataToSave.foodLog = dataToSave.foodLog.slice(-200);
-    }
-
-    var payload = {
-      email: S.user,
-      user_data: JSON.stringify(dataToSave),
-      updated_at: new Date().toISOString()
-    };
-
-    var res = await sb.from('forgeiq_users').upsert(payload, {onConflict: 'email'});
-
-    if(res.error){
-      // Table doesn't exist yet — tell user once, then stop trying
-      if(res.error.code === '42P01' || res.error.message.indexOf('does not exist') >= 0){
-        _cloudOK = false;
-        console.info('ForgeIQ: Supabase table not set up yet. Run the SQL setup. Data saved locally only.');
-      } else if(res.error.code === '42501' || res.error.message.indexOf('row-level security') >= 0){
-        _cloudOK = false;
-        console.info('ForgeIQ: Supabase RLS blocking saves. Disable RLS on forgeiq_users or add a policy. Data saved locally only.');
-      } else {
-        console.warn('ForgeIQ cloud save error:', res.error.message);
+    var url = SUPABASE_URL + '/rest/v1/' + path;
+    var fetchOpts = {
+      method: method,
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': 'Bearer ' + SUPABASE_ANON_KEY,
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=merge-duplicates,return=minimal'
       }
-    }
-  } catch(e){
-    // Network error — fail silently, localStorage still has the data
-    console.info('ForgeIQ: Cloud save skipped (offline?)');
+    };
+    if(body !== null) fetchOpts.body = JSON.stringify(body);
+    var response = await fetch(url, fetchOpts);
+    var status = response.status + 0; // plain number
+    var text = await response.text(); // plain string
+    return {status: status, text: text};
+  }catch(e){
+    return {status: 0, text: ''};
   }
 }
 
-// ── CLOUD LOAD ──
-async function loadFromCloud(email){
-  if(!sb || !email || !_cloudOK) return false;
+async function saveToCloud(){
+  if(!S.user || !_cloudOK) return;
   try{
-    var res = await sb.from('forgeiq_users').select('user_data').eq('email', email).maybeSingle();
+    var dataToSave = JSON.parse(JSON.stringify(S));
+    if(dataToSave.chatSessions && dataToSave.chatSessions.length > 20)
+      dataToSave.chatSessions = dataToSave.chatSessions.slice(0,20);
+    if(dataToSave.foodLog && dataToSave.foodLog.length > 200)
+      dataToSave.foodLog = dataToSave.foodLog.slice(-200);
+    var r = await sbREST('POST','forgeiq_users',{
+      email: S.user,
+      user_data: JSON.stringify(dataToSave),
+      updated_at: new Date().toISOString()
+    });
+    if(r.status === 401 || r.status === 403){ _cloudOK=false; }
+    else if(r.status === 404 || (r.text && r.text.indexOf('does not exist')>=0)){ _cloudOK=false; }
+    // 200/201/204 = success
+  }catch(e){}
+}
 
-    if(res.error){
-      if(res.error.code === '42P01'){
-        _cloudOK = false;
-        console.info('ForgeIQ: Table not set up. Using local data.');
-      }
-      return false;
-    }
-
-    if(!res.data || !res.data.user_data) return false; // new user, no cloud data yet
-
-    var parsed = JSON.parse(res.data.user_data);
-
-    // Full deep restore — every field
+async function loadFromCloud(email){
+  if(!email || !_cloudOK) return false;
+  try{
+    var r = await sbREST('GET',
+      'forgeiq_users?email=eq.'+encodeURIComponent(email)+'&select=user_data&limit=1',
+      null
+    );
+    if(!r.text || r.status >= 400) return false;
+    var rows = JSON.parse(r.text);
+    if(!rows || !rows.length || !rows[0] || !rows[0].user_data) return false;
+    var parsed = JSON.parse(rows[0].user_data);
     var fields = [
       'xp','streak','totalWorkouts','lastWorkoutDate','activePlanId',
       'plans','foodLog','prs','weightLog','weekWorkouts','milestonesDone',
       '_weekStamp','tasksDone','dailyQuestsDone','exHistory','exLastWeight',
       'exSessionXP','workoutHistory','dailyXP','profileXpAwarded',
       'chatSessions','moodLog','habits','journal','goals','skills',
-      'totalJournals','weekJournalCount','weekFoodDays'
+      'totalJournals','weekJournalCount','weekFoodDays','extraDone'
     ];
-    fields.forEach(function(f){ if(parsed[f] !== undefined) S[f] = parsed[f]; });
-
-    // Merge objects with defaults
-    S.profile = Object.assign({name:'',age:'',height:'',weight:'',goal:'muscle'}, parsed.profile||{});
-    S.macros   = Object.assign({cals:2000,protein:150,carbs:250,fat:65}, parsed.macros||{});
-    S.stats    = Object.assign({str:0,end:0,dis:0,vit:0}, parsed.stats||{});
-
+    fields.forEach(function(f){ if(parsed[f]!==undefined) S[f]=parsed[f]; });
+    S.profile=Object.assign({name:'',age:'',height:'',weight:'',goal:'muscle'},parsed.profile||{});
+    S.macros=Object.assign({cals:2000,protein:150,carbs:250,fat:65},parsed.macros||{});
+    S.stats=Object.assign({str:0,end:0,dis:0,vit:0},parsed.stats||{});
     return true;
-  } catch(e){
-    console.info('ForgeIQ: Cloud load failed:', e.message);
-    return false;
-  }
+  }catch(e){ return false; }
 }
 
-// ── PATCH SAVE TO ALSO SYNC CLOUD (debounced 4s) ──
-var _origSave = null;
-var _cloudSaveTimer = null;
+var _origSave=null;
+var _cloudSaveTimer=null;
 function patchSaveWithCloud(){
-  if(_origSave) return;
-  _origSave = save;
-  save = function(){
+  if(_origSave)return;
+  _origSave=save;
+  save=function(){
     _origSave();
-    if(!_cloudOK) return;
+    if(!_cloudOK)return;
     clearTimeout(_cloudSaveTimer);
-    _cloudSaveTimer = setTimeout(function(){ saveToCloud(); }, 4000);
+    _cloudSaveTimer=setTimeout(function(){saveToCloud();},4000);
   };
 }
+
 
 
 // ─────────────────────────────────────────────────────────
@@ -6337,6 +6350,45 @@ aiMakePlan=async function(){
     console.error(err);notif('AI generation failed. Try again.','red');goPage('plans');
   }
 };
+
+
+// ─────────────────────────────────────────────────────────
+//  LOGOUT
+// ─────────────────────────────────────────────────────────
+function doLogout(){
+  if(!confirm('Sign out of ForgeIQ?')) return;
+  // Save to cloud immediately before logging out
+  saveToCloud().then(function(){
+    // Clear session data
+    localStorage.removeItem('fiq_last_user');
+    localStorage.removeItem('fiq_ak_persist');
+    // Reset state
+    S = {
+      user:null, xp:0, streak:0, totalWorkouts:0, lastWorkoutDate:null,
+      profile:{name:'',age:'',height:'',weight:'',goal:'muscle'},
+      macros:{cals:2000,protein:150,carbs:250,fat:65},
+      plans:[], activePlanId:null,
+      foodLog:[], prs:[], weightLog:[],
+      tasksDone:{}, milestonesDone:[], weekWorkouts:[], _weekStamp:'',
+      stats:{str:0,end:0,dis:0,vit:0},
+      chatSessions:[], moodLog:[], habits:[], journal:[], goals:[], skills:[],
+      exHistory:{}, workoutHistory:[], dailyQuestsDone:{}, extraDone:{},
+      weekJournalCount:0, weekFoodDays:[], totalJournals:0,
+      dailyXP:{}, profileXpAwarded:false, exLastWeight:{}, exSessionXP:{}
+    };
+    // Stop cloud saves
+    _origSave = null;
+    clearTimeout(_cloudSaveTimer);
+    // Go back to entrance
+    document.querySelectorAll('.screen').forEach(function(s){ s.classList.remove('active'); });
+    var entrance = $id('screen-entrance');
+    if(entrance) entrance.classList.add('active');
+    // Reset chat
+    cHistory = []; cActiveSessionId = null;
+    var msgs = $id('chat-msgs'); if(msgs) msgs.innerHTML = '';
+    window._iDone = false;
+  });
+}
 
 </script>
 </body>
